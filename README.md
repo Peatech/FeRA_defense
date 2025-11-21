@@ -1,10 +1,10 @@
 # FeRA: Federated Representation Attention Defense
 
-FeRA (Federated Representation Attention) is a defense mechanism for federated learning systems against backdoor attacks. This repository contains the **FeRA Visualize** implementation, which computes and visualizes per-client metrics for backdoor detection and applies configurable filtering logic to identify and exclude malicious clients.
+FeRA (Federated Representation Attention) is a defense mechanism for federated learning systems against backdoor attacks. This repository contains the **FeRA** implementation, which computes and visualizes per-client metrics for backdoor detection and applies configurable filtering logic to identify and exclude malicious clients.
 
 ## Overview
 
-FeRA Visualize is an anomaly detection defense that:
+FeRA is an anomaly detection defense that:
 - Computes 6 per-client metrics per round for backdoor detection
 - Applies configurable multi-component filtering logic
 - Supports two filter variants (v1 and v2) with switchable components
