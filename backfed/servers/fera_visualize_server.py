@@ -1,26 +1,9 @@
 """
-FeRA Visualize Server - Visualization-only Defense
+FeRA Visualize Server
 
-This server computes and visualizes per-client metrics for backdoor detection analysis
-without performing any filtering. All clients are aggregated using standard FedAvg.
+Multi-component filtering defense for backdoor detection in federated learning.
 
-Metrics computed per round (per client):
-1. Spectral Norm: Largest eigenvalue of representation delta covariance
-2. Delta Norm: Frobenius norm of representation difference  
-3. Combined Score: Weighted combination of normalized spectral + delta
-4. TDA (Temporal Direction Alignment): Cosine similarity with global model
-5. Mutual Similarity: Mean pairwise cosine similarity with other clients
-6. Param Change Count: Number of parameters with |change| > threshold
-
-Output per round:
-- 6 ranked CSV files (one per metric)
-- 1 master CSV with all metrics
-- Console logs with ranked tables for quick inspection
-
-Reference: fera_visualize LaTeX document (lines 22-217)
-
-Author: AI Assistant
-Date: 2025-10-27
+Computes per-client metrics and applies configurable filters to detect malicious clients.
 """
 
 import torch
@@ -46,41 +29,11 @@ class FeraVisualizeServer(AnomalyDetectionServer):
     """
     FeRA Visualize: Multi-component filtering defense with switchable variants.
     
-    Computes 6 per-client metrics and applies configurable filter logic based on variant:
+    Variant 1 (Default): Multi-component filters (default, collusion, outlier, scaled norm)
+    Variant 2 (Simplified): Consistency + collusion + norm-inflation filters with clipping
     
-    Metrics computed:
-    1. Spectral Norm: Largest eigenvalue of representation delta covariance
-    2. Delta Norm: Frobenius norm of representation difference
-    3. Combined Score: Weighted combination of normalized spectral + delta
-    4. TDA (Temporal Direction Alignment): Cosine similarity with global model
-    5. Mutual Similarity: Maximum pairwise cosine similarity with other clients
-    6. Param Change Count: Number of parameters with |change| > threshold
-    
-    VARIANT 1 (Original Multi-Component Logic) - Default:
-    ────────────────────────────────────────────────────────
-    Filter Components (independently configurable):
-    1. Default Filter: Combined ≤ 50%, TDA ≤ 50%, MutualSim ≥ 70% (optional)
-    2. Collusion Filter: Top 40% mutual_sim AND top 40% TDA (optional)
-    3. Outlier Filter: Clients in both extremes of metrics (optional)
-    4. Scaled Norm Filter: spectral_ratio > threshold (optional)
-    
-    Final malicious set = UNION of all enabled filters
-    
-    VARIANT 2 (Simplified Logic):
-    ────────────────────────────────────────────────────────
-    Filter Components:
-    1. Consistency Filter: Bottom-50% Combined AND Bottom-50% TDA (always on)
-    2. Collusion Filter: Bottom-50% Combined AND Bottom-50% MutualSim (optional)
-    3. Norm-Inflation Filter: Spectral Ratio > 100 (optional)
-    
-    Final malicious set = UNION of all enabled filters
-    
-    Switching Variants:
-    ───────────────────
-    Set filter_variant="v1" (default) or filter_variant="v2" in configuration.
-    Example CLI: aggregator_config.fera_visualize.filter_variant=v2
-    
-    Only benign clients are aggregated using FedAvg.
+    Configurable via filter_variant parameter ("v1" or "v2").
+    Visualizations (CSV outputs, ranked tables) can be enabled via enable_visualizations flag.
     """
     
     defense_categories = ["anomaly_detection"]
@@ -120,6 +73,8 @@ class FeraVisualizeServer(AnomalyDetectionServer):
         # Eigenvalue metrics parameters
         top_k_eigenvalues: int = 5,  # Number of top eigenvalues to track (default: 5)
         effective_rank_threshold: float = 0.9,  # Variance percentage for effective rank (default: 0.9 = 90%)
+        # Visualization parameters
+        enable_visualizations: bool = False,  # Enable CSV outputs and ranked table logs (default: False)
         **kwargs
     ):
         """
@@ -153,6 +108,7 @@ class FeraVisualizeServer(AnomalyDetectionServer):
             noise_std: Std dev for fixed noise mode (default: 0.025, recommend: 0.05-0.1 for stronger noise)
             top_k_eigenvalues: Number of top eigenvalues to track for visualization (default: 5)
             effective_rank_threshold: Variance percentage threshold for effective rank computation (default: 0.9 = 90%)
+            enable_visualizations: Enable CSV outputs and ranked table console logs (default: False)
         """
         super().__init__(server_config, server_type, eta, **kwargs)
         
@@ -170,6 +126,9 @@ class FeraVisualizeServer(AnomalyDetectionServer):
         # Eigenvalue metrics parameters
         self.top_k_eigenvalues = top_k_eigenvalues
         self.effective_rank_threshold = effective_rank_threshold
+        
+        # Visualization parameters
+        self.enable_visualizations = enable_visualizations
         
         # Store parameters
         self.root_size = root_size
@@ -289,13 +248,7 @@ class FeraVisualizeServer(AnomalyDetectionServer):
         log(INFO, "═══════════════════════════════════════════════")
     
     def _create_root_loader(self) -> DataLoader:
-        """
-        Create root dataset loader for feature extraction.
-        Supports both in-distribution (testset) and OOD datasets.
-        
-        Returns:
-            DataLoader with root_size samples
-        """
+        """Create root dataset loader for feature extraction."""
         ood_dataset = None
         
         if self.use_ood_root_dataset:
@@ -318,15 +271,7 @@ class FeraVisualizeServer(AnomalyDetectionServer):
         )
     
     def _auto_detect_feature_dim(self) -> int:
-        """
-        Auto-detect the feature dimension of the penultimate layer.
-        
-        Performs a test forward pass through the model to determine
-        the actual feature dimension, handling different architectures.
-        
-        Returns:
-            Feature dimension (int)
-        """
+        """Auto-detect feature dimension via test forward pass."""
         # Get a sample batch from test set
         test_batch = next(iter(self.test_loader))
         if isinstance(test_batch, (list, tuple)):
@@ -809,20 +754,9 @@ class FeraVisualizeServer(AnomalyDetectionServer):
         malicious_clients: List[int]
     ) -> List[Tuple[client_id, num_examples, StateDict]]:
         """
-        Clip malicious client updates using adaptive threshold (median of all update norms).
+        Clip malicious client updates using two-stage adaptive thresholding.
         
-        This method:
-        1. Computes update deltas (client_update - global_model) for all clients
-        2. Calculates L2 norm of each delta
-        3. Uses median of all norms as clipping threshold
-        4. Clips only malicious client updates (preserves direction, limits magnitude)
-        
-        Args:
-            client_updates: List of (client_id, num_examples, state_dict)
-            malicious_clients: List of client IDs flagged as malicious
-        
-        Returns:
-            List of client updates with malicious ones clipped (in-place modification)
+        Stage 1: Clip to median norm, Stage 2: Clip to percentage of median.
         """
         if not malicious_clients:
             return client_updates
@@ -830,12 +764,10 @@ class FeraVisualizeServer(AnomalyDetectionServer):
         malicious_set = set(malicious_clients)
         global_state_dict = dict(self.global_model.named_parameters())
         
-        # Compute update norms for all clients
         update_norms = []
         client_diffs = {}
         
         for client_id, num_examples, client_params in client_updates:
-            # Compute update delta
             diff_dict = {}
             flatten_weights = []
             
@@ -845,7 +777,6 @@ class FeraVisualizeServer(AnomalyDetectionServer):
                 if name in global_state_dict:
                     diff = param.to(self.device) - global_state_dict[name]
                     diff_dict[name] = diff
-                    # Collect weights/biases for norm calculation
                     if 'weight' in name or 'bias' in name:
                         flatten_weights.append(diff.view(-1))
             
@@ -858,7 +789,6 @@ class FeraVisualizeServer(AnomalyDetectionServer):
                 update_norms.append(0.0)
                 client_diffs[client_id] = diff_dict
         
-        # Compute adaptive clipping threshold (median of all update norms)
         if not update_norms:
             log(WARNING, "FeRA Visualize V2: No update norms computed, skipping clipping")
             return client_updates
@@ -868,7 +798,6 @@ class FeraVisualizeServer(AnomalyDetectionServer):
         log(INFO, f"FeRA Visualize V2: Clipping thresholds - Median: {clip_norm:.6f}, "
                   f"{int(self.clip_percentage*100)}%: {percentage_clip_norm:.6f}")
         
-        # Two-stage clipping for malicious client updates
         stage1_clipped = 0
         stage2_clipped = 0
         
@@ -882,7 +811,6 @@ class FeraVisualizeServer(AnomalyDetectionServer):
             diff_dict = client_diffs[client_id]
             flatten_weights = []
             
-            # Compute current norm
             for name, diff in diff_dict.items():
                 if 'weight' in name or 'bias' in name:
                     flatten_weights.append(diff.view(-1))
@@ -894,17 +822,13 @@ class FeraVisualizeServer(AnomalyDetectionServer):
             current_norm = torch.linalg.norm(flatten_weights, ord=2).item()
             original_norm = current_norm
             
-            # Stage 1: Clip if norm exceeds median threshold
             if current_norm > clip_norm:
                 scaling_factor = clip_norm / current_norm
                 
-                # Apply clipping to client_params (in-place)
                 for name, param in client_params.items():
                     if name in diff_dict:
-                        # Update client_params to be: global + clipped_diff
                         param.data.copy_(global_state_dict[name] + diff_dict[name] * scaling_factor)
                 
-                # Recompute diff_dict and norm after stage 1 clipping
                 for name, param in client_params.items():
                     if name in global_state_dict:
                         diff_dict[name] = param.to(self.device) - global_state_dict[name]
@@ -921,19 +845,13 @@ class FeraVisualizeServer(AnomalyDetectionServer):
                 log(INFO, f"FeRA Visualize V2: Stage 1 - Clipped client {client_id} "
                           f"(norm: {original_norm:.6f} -> {current_norm:.6f})")
             
-            # Stage 2: Apply percentage clip to ALL malicious clients (catches evasive updates)
-            # Clip downward if norm exceeds percentage threshold
-            # This ensures updates that reduced their norm to evade Stage 1 still get clipped
             if current_norm > percentage_clip_norm:
                 scaling_factor = percentage_clip_norm / current_norm
                 
-                # Apply percentage clipping to client_params (in-place)
                 for name, param in client_params.items():
                     if name in diff_dict:
-                        # Update client_params to be: global + percentage_clipped_diff
                         param.data.copy_(global_state_dict[name] + diff_dict[name] * scaling_factor)
                 
-                # Recompute norm after stage 2 clipping for logging
                 for name, param in client_params.items():
                     if name in global_state_dict:
                         diff_dict[name] = param.to(self.device) - global_state_dict[name]
@@ -952,12 +870,9 @@ class FeraVisualizeServer(AnomalyDetectionServer):
                 log(INFO, f"FeRA Visualize V2: Stage 2 - Clipped client {client_id} "
                           f"(norm: {current_norm:.6f} -> {final_norm:.6f})")
             else:
-                # Norm is already below percentage threshold - this is an evasive update
-                # that reduced its norm to avoid Stage 1 clipping
-                # We still count it as "processed" by Stage 2, but don't scale it up
                 stage2_clipped += 1
                 log(INFO, f"FeRA Visualize V2: Stage 2 - Client {client_id} already below threshold "
-                          f"(norm: {current_norm:.6f} <= {percentage_clip_norm:.6f}, evasive update detected)")
+                          f"(norm: {current_norm:.6f} <= {percentage_clip_norm:.6f})")
         
         log(INFO, f"FeRA Visualize V2: Stage 1 clipped {stage1_clipped}/{len(malicious_clients)} malicious clients")
         log(INFO, f"FeRA Visualize V2: Stage 2 clipped {stage2_clipped}/{len(malicious_clients)} malicious clients")
@@ -966,62 +881,39 @@ class FeraVisualizeServer(AnomalyDetectionServer):
     @torch.no_grad()
     def _add_adaptive_noise(self, clip_norm: float):
         """
-        Add noise to global model parameters after aggregation.
+        Add noise to global model parameters.
         
-        Two modes:
-        1. Adaptive: noise = N(0, lambda * clip_norm * std(param))
-           - Adapts to parameter scale and clipping threshold
-           - Good when you want noise proportional to parameter values
-        
-        2. Fixed: noise = N(0, noise_std)
-           - Constant noise level (like WeakDP)
-           - More predictable, easier to tune
-           - Better for strong noise requirements
-        
-        Adds noise to all trainable parameters (weights and biases) that are not in ignore_weights.
-        
-        Args:
-            clip_norm: Clipping threshold used (for noise scaling in adaptive mode)
+        Supports adaptive (scales with param std and clip_norm) and fixed modes.
         """
         noise_added_count = 0
         skipped_ignore = 0
         skipped_buffers = 0
         total_noise_magnitude = 0.0
         
-        # Count total parameters for logging
         all_params = list(self.global_model.named_parameters())
         total_params = len(all_params)
         
         for name, param in all_params:
-            # Skip parameters in ignore_weights list (if any)
             if any(pattern in name for pattern in self.ignore_weights):
                 skipped_ignore += 1
                 continue
             
-            # Skip buffer parameters (running stats, num_batches_tracked) - though these shouldn't be in named_parameters()
             if "running" in name or "num_batches_tracked" in name:
                 skipped_buffers += 1
                 continue
             
-            # Compute noise standard deviation based on mode
             if self.noise_mode == "adaptive":
-                # Adaptive noise: scales with parameter std and clip_norm
                 param_std = torch.std(param).item()
                 noise_std_val = self.noise_lambda * clip_norm * param_std
             elif self.noise_mode == "fixed":
-                # Fixed noise: constant std (like WeakDP)
                 noise_std_val = self.noise_std
             else:
-                # Default to fixed if mode is invalid
                 log(WARNING, f"Invalid noise_mode '{self.noise_mode}', defaulting to fixed")
                 noise_std_val = self.noise_std
             
-            # Add Gaussian noise
             noise = torch.normal(0, noise_std_val, param.shape, device=param.device)
             param.data.add_(noise)
             noise_added_count += 1
-            
-            # Track total noise magnitude for logging
             total_noise_magnitude += torch.abs(noise).sum().item()
         
         # Log with mode-specific details
@@ -1124,16 +1016,14 @@ class FeraVisualizeServer(AnomalyDetectionServer):
             all_metrics = self._compute_all_metrics(client_updates)
             metrics_time = time.perf_counter() - metrics_start_time
             
-            # Log ranked tables to console
-            self._log_metrics_tables(all_metrics, self.current_round)
-            
-            # Save to CSV files
-            self._save_metrics_csvs(all_metrics, self.current_round)
-            
-            log(INFO, "")
-            log(INFO, f"✓ Metrics saved to: {self.metrics_output_dir}")
-            log(INFO, "═══════════════════════════════════════════════")
-            log(INFO, "")
+            # Log ranked tables and save CSVs only if visualizations enabled
+            if self.enable_visualizations:
+                self._log_metrics_tables(all_metrics, self.current_round)
+                self._save_metrics_csvs(all_metrics, self.current_round)
+                log(INFO, "")
+                log(INFO, f"✓ Metrics saved to: {self.metrics_output_dir}")
+                log(INFO, "═══════════════════════════════════════════════")
+                log(INFO, "")
             
         except Exception as e:
             log(WARNING, f"Failed to compute metrics: {str(e)}")
@@ -1278,8 +1168,7 @@ class FeraVisualizeServer(AnomalyDetectionServer):
         client_models = self._load_client_models(client_updates)
         client_ids = list(client_models.keys())
         
-        # Phase 1: Representation-based metrics (spectral, delta, combined)
-        log(INFO, "Computing representation-based metrics...")
+        # Compute representation-based metrics (spectral, delta, combined)
         client_representations = self._extract_all_representations(client_models)
         global_representation = self._extract_global_representation()
         
@@ -1311,15 +1200,13 @@ class FeraVisualizeServer(AnomalyDetectionServer):
         all_metrics['delta_norm_normed'] = delta_normed
         all_metrics['combined_score'] = combined_scores
         
-        # Phase 2: Parameter-based metrics (TDA, mutual similarity)
-        log(INFO, "Computing parameter-based metrics...")
+        # Compute parameter-based metrics (TDA, mutual similarity)
         tda_scores = self._compute_tda_scores(client_updates)
         mutual_similarity = self._compute_mutual_similarity(client_updates)
         
         all_metrics['tda'] = tda_scores
         all_metrics['mutual_similarity'] = mutual_similarity
         
-        log(INFO, f"✓ Computed all metrics for {len(client_ids)} clients")
         return all_metrics
     
     def _load_client_models(
@@ -1546,28 +1433,10 @@ class FeraVisualizeServer(AnomalyDetectionServer):
         global_representation: torch.Tensor
     ) -> Dict[str, Dict[int, float]]:
         """
-        Compute comprehensive eigenvalue-based metrics from delta covariance.
+        Compute eigenvalue-based metrics from delta covariance.
         
-        Formula (from LaTeX lines 56-61):
-        Δᵢ = Rᵢ - R_global
-        Δᵢ_centered = Δᵢ - mean(Δᵢ)
-        Cᵢ = (Δᵢ_centered^T @ Δᵢ_centered) / (n-1)
-        
-        Computes multiple metrics:
-        - spectral_norm: λ_max (largest eigenvalue)
-        - trace: sum of all eigenvalues (total variance)
-        - eigenvalue_1, ..., eigenvalue_k: top-k eigenvalues
-        - effective_rank: number of eigenvalues needed for threshold% variance
-        - condition_number: λ_max / (λ_min + epsilon)
-        - eigenvalue_entropy: Shannon entropy of normalized eigenvalue distribution
-        - eigenvalue_decay_rate: λ_2 / (λ_max + epsilon)
-        
-        Args:
-            client_representations: Dict of client_id -> representations [root_size, D]
-            global_representation: Global model representations [root_size, D]
-            
-        Returns:
-            Dict mapping metric_name -> {client_id: value}
+        Returns metrics including spectral_norm, trace, top-k eigenvalues, effective_rank,
+        condition_number, eigenvalue_entropy, and eigenvalue_decay_rate.
         """
         # Initialize all metric dictionaries
         metrics = {
@@ -1686,19 +1555,7 @@ class FeraVisualizeServer(AnomalyDetectionServer):
         client_representations: Dict[int, torch.Tensor],
         global_representation: torch.Tensor
     ) -> Dict[int, float]:
-        """
-        Compute delta norms (Frobenius norm of representation difference).
-        
-        Formula (from LaTeX lines 64-67):
-        ‖Δᵢ‖_F = sqrt(sum((Δᵢ)²))
-        
-        Args:
-            client_representations: Dict of client_id -> representations
-            global_representation: Global model representations
-            
-        Returns:
-            Dict of client_id -> delta norm (float)
-        """
+        """Compute Frobenius norm of representation difference."""
         delta_norms = {}
         
         for cid, client_repr in client_representations.items():
@@ -1715,20 +1572,7 @@ class FeraVisualizeServer(AnomalyDetectionServer):
         self,
         scores: Dict[int, float]
     ) -> Dict[int, float]:
-        """
-        Robust normalization using median and IQR.
-        
-        Formula (from LaTeX lines 69-74):
-        normalized(x) = (x - median(x)) / (IQR(x) + ε)
-        
-        where IQR = Q3 - Q1
-        
-        Args:
-            scores: Dict of client_id -> score
-            
-        Returns:
-            Dict of client_id -> normalized score
-        """
+        """Robust normalization using median and IQR."""
         if not scores:
             return {}
         
@@ -1753,19 +1597,7 @@ class FeraVisualizeServer(AnomalyDetectionServer):
         spectral_normed: Dict[int, float],
         delta_normed: Dict[int, float]
     ) -> Dict[int, float]:
-        """
-        Compute combined score from normalized spectral and delta norms.
-        
-        Formula (from LaTeX lines 76-79):
-        combined_i = 0.6 * spectral_normed_i + 0.4 * delta_normed_i
-        
-        Args:
-            spectral_normed: Normalized spectral norms
-            delta_normed: Normalized delta norms
-            
-        Returns:
-            Dict of client_id -> combined score
-        """
+        """Compute weighted combination of normalized spectral and delta norms."""
         combined_scores = {}
         
         for cid in spectral_normed.keys():
@@ -1780,21 +1612,10 @@ class FeraVisualizeServer(AnomalyDetectionServer):
         client_updates: List[Tuple[client_id, num_examples, StateDict]]
     ) -> Dict[int, float]:
         """
-        Compute TDA (Temporal Direction Alignment) scores.
+        Compute Temporal Direction Alignment (TDA) scores.
         
-        Measures cosine similarity between client model and global model.
-        Uses fera_anonm approach (model-to-model similarity).
-        Normalized to [0, 1] range for easier interpretation.
-        
-        Formula:
-        TDA_i = [(θ_i · θ_global) / (‖θ_i‖ · ‖θ_global‖) + 1] / 2
-        
-        Args:
-            client_updates: List of (client_id, num_examples, state_dict)
-            
-        Returns:
-            Dict of client_id -> TDA score [0, 1]
-            0.0 = opposite direction, 0.5 = orthogonal, 1.0 = aligned
+        Measures cosine similarity between client and global models.
+        Returns scores in [0, 1] range where 1.0 = aligned, 0.0 = opposite.
         """
         tda_scores = {}
         
@@ -1829,20 +1650,8 @@ class FeraVisualizeServer(AnomalyDetectionServer):
         """
         Compute mutual similarity (maximum pairwise cosine similarity).
         
-        Similar to FoolsGold's approach, computes the maximum cosine similarity
-        between each client's update and all other clients' updates.
-        
-        Formula:
-        U = stack(u₁, u₂, ..., uₙ) where uᵢ = vec(θᵢ - θ_global)
-        Û = U / ‖U‖₂ (row-wise normalization)
-        S = Û @ Û^T (pairwise cosine similarity matrix)
-        mutual_i = max(S[i, :]) excluding S[i, i]
-        
-        Args:
-            client_updates: List of (client_id, num_examples, state_dict)
-            
-        Returns:
-            Dict of client_id -> maximum mutual similarity score
+        Computes the maximum cosine similarity between each client's update
+        and all other clients' updates.
         """
         mutual_scores = {}
         
@@ -1865,51 +1674,29 @@ class FeraVisualizeServer(AnomalyDetectionServer):
                 continue
         
         if len(update_vectors) < 2:
-            # Need at least 2 clients for mutual similarity
             return {cid: 0.0 for cid in client_ids}
         
-        # Stack update vectors [N, P]
         U = torch.stack(update_vectors, dim=0)
-        
-        # L2-normalize rows
         U_norms = torch.linalg.norm(U, dim=1, keepdim=True).clamp(min=self.epsilon)
         U_normalized = U / U_norms
-        
-        # Compute pairwise cosine similarity matrix [N, N]
         S = U_normalized @ U_normalized.T
         
-        # Compute mutual similarity for each client
         N = len(client_ids)
         for i, cid in enumerate(client_ids):
-            # Maximum similarity to any other client (exclude self)
-            # Set diagonal to very negative value to exclude self-similarity
             S_masked = S[i].clone()
-            S_masked[i] = -1e9  # Mask self-similarity
+            S_masked[i] = -1e9
             mutual_sim = S_masked.max().item()
             mutual_scores[cid] = mutual_sim
         
         return mutual_scores
     
-    def _flatten_state_dict(
-        self,
-        state_dict: StateDict
-    ) -> torch.Tensor:
-        """
-        Flatten all parameters in state_dict into a single 1D tensor.
-        
-        Args:
-            state_dict: Model state dictionary
-            
-        Returns:
-            Flattened tensor of all parameters (on self.device)
-        """
+    def _flatten_state_dict(self, state_dict: StateDict) -> torch.Tensor:
+        """Flatten all parameters into a single 1D tensor."""
         flat_params = []
-        for key in sorted(state_dict.keys()):  # Sort for consistency
+        for key in sorted(state_dict.keys()):
             param = state_dict[key]
-            # Skip non-differentiable parameters
             if key in self.ignore_weights:
                 continue
-            # Ensure parameter is on the correct device before flattening
             if isinstance(param, torch.Tensor):
                 param = param.to(self.device)
             flat_params.append(param.flatten())
@@ -1924,13 +1711,7 @@ class FeraVisualizeServer(AnomalyDetectionServer):
         all_metrics: Dict[str, Dict[int, float]],
         round_num: int
     ):
-        """
-        Log ranked metric tables to console for quick visual inspection.
-        
-        Args:
-            all_metrics: Dictionary of metric_name -> {client_id: value}
-            round_num: Current round number
-        """
+        """Log ranked metric tables to console."""
         # Get ground truth labels
         ground_truth = self.client_manager.get_malicious_clients()
         
@@ -1991,17 +1772,7 @@ class FeraVisualizeServer(AnomalyDetectionServer):
         all_metrics: Dict[str, Dict[int, float]],
         round_num: int
     ):
-        """
-        Save metrics to a single cumulative CSV file for all rounds.
-        
-        Creates a single file: all_rounds_metrics.csv
-        - Header with ground truth malicious clients (written once)
-        - Each round's data appended with round number
-        
-        Args:
-            all_metrics: Dictionary of metric_name -> {client_id: value}
-            round_num: Current round number
-        """
+        """Save metrics to cumulative CSV file (all_rounds_metrics.csv)."""
         # Get ground truth labels
         ground_truth = self.client_manager.get_malicious_clients()
         

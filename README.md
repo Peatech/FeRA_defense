@@ -1,10 +1,10 @@
-# FeRA: Federated Representation Analysis Defense
+# FeRA: Federated Representation Attention Defense
 
-FeRA (Federated Representation Analysis) is a defense mechanism for federated learning systems against backdoor attacks. This repository contains the **FeRA Visualize** implementation, which computes and visualizes per-client metrics for backdoor detection and applies configurable filtering logic to identify and exclude malicious clients.
+FeRA (Federated Representation Attention) is a defense mechanism for federated learning systems against backdoor attacks. This repository contains the **FeRA** implementation, which computes and visualizes per-client metrics for backdoor detection and applies configurable filtering logic to identify and exclude malicious clients.
 
 ## Overview
 
-FeRA Visualize is an anomaly detection defense that:
+FeRA is an anomaly detection defense that:
 - Computes 6 per-client metrics per round for backdoor detection
 - Applies configurable multi-component filtering logic
 - Supports two filter variants (v1 and v2) with switchable components
@@ -18,20 +18,14 @@ FeRA Visualize is an anomaly detection defense that:
 3. **Combined Score**: Weighted combination of normalized spectral + delta norms
 4. **TDA (Temporal Direction Alignment)**: Cosine similarity with global model
 5. **Mutual Similarity**: Mean pairwise cosine similarity with other clients
-6. **Param Change Count**: Number of parameters with |change| > threshold
+6. **Spectral norm ratio**
 
 ### Filter Variants
 
 **Variant 1 (Default)**: Multi-component filtering with independently configurable components:
 - Default Filter: Combined ≤ threshold, TDA ≤ threshold, MutualSim ≥ threshold
-- Collusion Filter: Top mutual_sim AND top TDA
-- Outlier Filter: Clients in both extremes of metrics
 - Scaled Norm Filter: spectral_ratio > threshold
 
-**Variant 2**: Simplified logic with:
-- Consistency Filter: Bottom Combined AND Bottom TDA (always on)
-- Collusion Filter: Bottom Combined AND Bottom MutualSim (optional)
-- Norm-Inflation Filter: Spectral Ratio > threshold (optional)
 
 ## Dependencies
 
@@ -109,7 +103,6 @@ python main.py \
 - `aggregator=fera_visualize` - Use FeRA Visualize defense
 - `aggregator_config.fera_visualize.spectral_weight` - Weight for spectral norm (default: 0.6)
 - `aggregator_config.fera_visualize.delta_weight` - Weight for delta norm (default: 0.4)
-- `aggregator_config.fera_visualize.filter_variant` - Filter variant: "v1" or "v2" (default: "v1")
 
 #### Filter Configuration
 
@@ -118,11 +111,6 @@ python main.py \
 - `aggregator_config.fera_visualize.default_filter.combined_threshold` - Combined score threshold (default: 0.50)
 - `aggregator_config.fera_visualize.default_filter.tda_threshold` - TDA threshold (default: 0.50)
 - `aggregator_config.fera_visualize.default_filter.mutual_sim_threshold` - Mutual similarity threshold (default: 0.70)
-
-**Other Filters:**
-- `aggregator_config.fera_visualize.collusion_filter.enabled` - Enable collusion filter
-- `aggregator_config.fera_visualize.outlier_filter.enabled` - Enable outlier filter
-- `aggregator_config.fera_visualize.scaled_norm_filter.enabled` - Enable scaled norm filter
 
 #### Attack Configuration
 
@@ -167,28 +155,6 @@ python main.py \
     num_cpus=12
 ```
 
-### Example: Cross-Silo Mode
-
-```bash
-python main.py \
-    --config-name cifar10 \
-    aggregator=fera_visualize \
-    aggregator_config.fera_visualize.default_filter.enabled=true \
-    aggregator_config.fera_visualize.default_filter.combined_threshold=0.60 \
-    aggregator_config.fera_visualize.default_filter.tda_threshold=0.60 \
-    aggregator_config.fera_visualize.default_filter.mutual_sim_threshold=0.60 \
-    atk_config=cifar10_multishot \
-    atk_config.data_poison_method=pattern \
-    atk_config.model_poison_method=neurotoxin \
-    model=resnet18 \
-    alpha=0.5 \
-    cross_silo=true \
-    cross_silo_num_clients=10 \
-    cross_silo_num_attackers=2 \
-    num_rounds=100 \
-    seed=42
-```
-
 ## Project Structure
 
 ```
@@ -210,7 +176,7 @@ Fera_defence/
 
 ## Critical Changes from BackFed
 
-This repository is based on the [BackFed](https://github.com/backfed) framework, with the following critical modifications:
+This repository is based on the [BackFed](https://github.com/thinh-dao/BackFed.git) framework, with the following critical modifications:
 
 ### 1. FeRA Visualize Implementation
 - **New Defense**: Added `FeraVisualizeServer` with multi-component filtering logic
@@ -218,22 +184,7 @@ This repository is based on the [BackFed](https://github.com/backfed) framework,
 - **Filter Variants**: Supports two filter variants (v1 and v2) with configurable components
 - **Location**: `backfed/servers/fera_visualize_server.py`
 
-### 2. Cross-Silo Federated Learning Support
-- **New Feature**: Added cross-silo mode where the same clients participate every round
-- **Implementation**: 
-  - Modified `backfed/client_manager.py` to support fixed client selection
-  - Modified `backfed/utils/system_utils.py` to handle cross-silo configuration
-  - Added `_cross_silo_selection()` method in `ClientManager`
-- **Configuration**: 
-  - `cross_silo=true` - Enable cross-silo mode
-  - `cross_silo_num_clients` - Total number of clients
-  - `cross_silo_num_attackers` - Number of attackers
-
-### 3. FeRA Variants
-- **Included**: Only `fera_visualize_server.py` (other FeRA variants excluded)
-- **Excluded**: `fera_server.py`, `fera_anonm_server.py`, `fera_anonm_server_verified.py`
-
-### 4. Configuration Management
+### 2. Configuration Management
 - **Note**: `main.py` uses Hydra for configuration, but the core defense logic is framework-agnostic
 - The FeRA Visualize server can be integrated into other frameworks by importing `FeraVisualizeServer` directly
 
@@ -287,11 +238,11 @@ FeRA Visualize generates the following outputs per round:
 If you use FeRA in your research, please cite:
 
 ```bibtex
-@article{fera2024,
-  title={FeRA: Federated Representation Analysis Defense},
-  author={Your Name},
-  journal={Conference/Journal Name},
-  year={2024}
+@article{obioma2025defending,
+  title={Defending the Edge: Representative-Attention Defense against Backdoor Attacks in Federated Learning},
+  author={Obioma, Chibueze Peace and Sun, Youcheng and Mustafa, Mustafa A},
+  journal={arXiv preprint arXiv:2505.10297},
+  year={2025}
 }
 ```
 
@@ -313,11 +264,7 @@ This project is built on top of the **BackFed** framework. We acknowledge and th
 
 ## License
 
-[Specify your license here]
-
-## Contact
-
-[Your contact information]
+This project is licensed under the MIT License - see the LICENSE file for details.
 
 ## Notes
 
